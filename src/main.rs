@@ -34,20 +34,25 @@ enum Commands {
         buffer_ms: u32,
         #[arg(long, default_value = "0.0.0.0")]
         bind: IpAddr,
-        #[arg(long, default_value_t = 0)]
+        /// TCP control port; use 0 to request an ephemeral port.
+        #[arg(long, default_value_t = oto::protocol::DEFAULT_PORT)]
         port: u16,
         #[arg(long)]
         code: Option<String>,
+        /// Accept direct connections without generating or checking a code.
+        #[arg(long, conflicts_with = "code")]
+        no_code: bool,
         #[arg(long)]
         no_discovery: bool,
         #[arg(long, hide = true)]
         headless: bool,
     },
-    /// Discover a host by connection code and play its audio.
+    /// Join by connection code, or directly with --host when no code is required.
     Join {
-        code: String,
-        /// Direct connection fallback when Bonjour is blocked.
-        #[arg(long)]
+        #[arg(required_unless_present = "host")]
+        code: Option<String>,
+        /// Host IP or IP:PORT (default port: 47670).
+        #[arg(long, value_parser = parse_host)]
         host: Option<SocketAddr>,
         #[arg(long, hide = true)]
         headless: bool,
@@ -73,6 +78,17 @@ enum Commands {
     },
     /// Check macOS support, audio devices and configuration.
     Doctor,
+}
+
+fn parse_host(value: &str) -> Result<SocketAddr, String> {
+    value
+        .parse::<SocketAddr>()
+        .or_else(|_| {
+            value
+                .parse::<IpAddr>()
+                .map(|ip| SocketAddr::new(ip, oto::protocol::DEFAULT_PORT))
+        })
+        .map_err(|_| "Host must be an IP address or IP:PORT".into())
 }
 
 fn latency_ms(value: &str) -> Result<i32> {
@@ -102,6 +118,7 @@ async fn run() -> Result<()> {
             bind,
             port,
             code,
+            no_code,
             no_discovery,
             headless,
         } => {
@@ -109,6 +126,7 @@ async fn run() -> Result<()> {
                 bind,
                 port,
                 code,
+                no_code,
                 buffer_ms,
                 tone: matches!(source, Source::Tone),
                 headless,
@@ -140,7 +158,7 @@ async fn run() -> Result<()> {
                 if json {
                     println!("{}", serde_json::to_string_pretty(&status)?);
                 } else {
-                    println!("{}: {}\nCode: {}\nOutput: {}\nBuffer: {}ms | Offset: {:+}ms\nClock offset: {:.3}ms | RTT: {:.3}ms\nClients: {}\nPackets sent: {} | Received: {} | Scheduled: {}\nMissing: {} | Late: {}", status.role, status.state, status.code, status.output, status.buffer_ms, status.latency_ms, status.clock_offset_ms, status.rtt_ms, status.clients.join(", "), status.sent, status.received, status.scheduled, status.missing, status.late);
+                    println!("{}: {}\nCode: {}\nControl port: {}\nOutput: {}\nBuffer: {}ms | Offset: {:+}ms\nClock offset: {:.3}ms | RTT: {:.3}ms\nClients: {}\nPackets sent: {} | Received: {} | Scheduled: {}\nMissing: {} | Late: {}", status.role, status.state, status.code.as_deref().unwrap_or("not required"), status.control_port, status.output, status.buffer_ms, status.latency_ms, status.clock_offset_ms, status.rtt_ms, status.clients.join(", "), status.sent, status.received, status.scheduled, status.missing, status.late);
                 }
             }
         }
@@ -255,5 +273,53 @@ async fn main() {
     if let Err(error) = run().await {
         eprintln!("oto: {error:#}");
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_port_and_explicit_override() {
+        let Cli {
+            command: Commands::Host { port, no_code, .. },
+        } = Cli::try_parse_from(["oto", "host"]).unwrap()
+        else {
+            panic!("expected host")
+        };
+        assert_eq!(port, 47670);
+        assert!(!no_code);
+        let Cli {
+            command: Commands::Host { port, no_code, .. },
+        } = Cli::try_parse_from(["oto", "host", "--port", "9000", "--no-code"]).unwrap()
+        else {
+            panic!("expected host")
+        };
+        assert_eq!(port, 9000);
+        assert!(no_code);
+        assert!(Cli::try_parse_from(["oto", "host", "--code", "AB234", "--no-code"]).is_err());
+    }
+
+    #[test]
+    fn direct_join_can_omit_code_and_port() {
+        let Cli {
+            command: Commands::Join { code, host, .. },
+        } = Cli::try_parse_from(["oto", "join", "--host", "192.168.1.14"]).unwrap()
+        else {
+            panic!("expected join")
+        };
+        assert!(code.is_none());
+        assert_eq!(
+            host.unwrap(),
+            "192.168.1.14:47670".parse::<SocketAddr>().unwrap()
+        );
+        assert_eq!(parse_host("192.168.1.14:9000").unwrap().port(), 9000);
+        assert_eq!(
+            parse_host("::1").unwrap(),
+            "[::1]:47670".parse::<SocketAddr>().unwrap()
+        );
+        assert!(Cli::try_parse_from(["oto", "join"]).is_err());
+        assert!(Cli::try_parse_from(["oto", "join", "--host", "not-an-address"]).is_err());
     }
 }

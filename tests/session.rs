@@ -80,6 +80,8 @@ fn multi_client_session_controls_and_reconnection() {
             "--no-discovery",
             "--bind",
             "127.0.0.1",
+            "--port",
+            "0",
             "--code",
             "AB234",
         ],
@@ -110,6 +112,20 @@ fn multi_client_session_controls_and_reconnection() {
     let mut tcp = TcpStream::connect(&address).unwrap();
     tcp.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
     writeln!(tcp, "{}", serde_json::json!({"type":"hello", "version":1, "code":"ZZZZZ", "name":"intruder", "udp_port":9999})).unwrap();
+    let mut line = String::new();
+    BufReader::new(tcp).read_line(&mut line).unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(&line).unwrap()["type"],
+        "reject"
+    );
+    let mut tcp = TcpStream::connect(&address).unwrap();
+    tcp.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    writeln!(
+        tcp,
+        "{}",
+        serde_json::json!({"type":"hello", "version":1, "name":"no-code", "udp_port":9999})
+    )
+    .unwrap();
     let mut line = String::new();
     BufReader::new(tcp).read_line(&mut line).unwrap();
     assert_eq!(
@@ -173,7 +189,16 @@ fn bonjour_discovers_a_code_without_an_ip() {
     let directory = TempDir::new().unwrap();
     let _server = start(
         directory.path(),
-        &["host", "--source", "tone", "--headless", "--code", "BC345"],
+        &[
+            "host",
+            "--source",
+            "tone",
+            "--headless",
+            "--port",
+            "0",
+            "--code",
+            "BC345",
+        ],
     );
     let expected = wait_for(directory.path(), |s| s["state"] == "streaming")["control_port"]
         .as_u64()
@@ -185,4 +210,35 @@ fn bonjour_discovers_a_code_without_an_ip() {
     assert_eq!(discovered.port(), expected as u16);
     assert!(TcpStream::connect_timeout(&discovered, Duration::from_secs(2)).is_ok());
     success(directory.path(), &["leave"]);
+}
+
+#[test]
+fn direct_session_without_a_code() {
+    let host = TempDir::new().unwrap();
+    let client = TempDir::new().unwrap();
+    let _server = start(
+        host.path(),
+        &[
+            "host",
+            "--source",
+            "tone",
+            "--headless",
+            "--no-discovery",
+            "--bind",
+            "127.0.0.1",
+            "--port",
+            "0",
+            "--no-code",
+        ],
+    );
+    let stats = wait_for(host.path(), |s| s["state"] == "streaming");
+    assert!(stats["code"].is_null());
+    let address = format!("127.0.0.1:{}", stats["control_port"].as_u64().unwrap());
+    let _client = start(client.path(), &["join", "--host", &address, "--headless"]);
+    let stats = wait_for(client.path(), |s| s["scheduled"].as_u64().unwrap_or(0) > 50);
+    assert!(stats["code"].is_null());
+    assert!(stats["received"].as_u64().unwrap() > 50);
+    assert_eq!(stats["state"], "playing");
+    success(client.path(), &["leave"]);
+    success(host.path(), &["leave"]);
 }

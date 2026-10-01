@@ -13,19 +13,21 @@ pub struct Advertisement {
     fullname: String,
 }
 impl Advertisement {
-    pub fn publish(code: &str, session: Uuid, port: u16) -> Result<Self> {
+    pub fn publish(code: Option<&str>, session: Uuid, port: u16) -> Result<Self> {
         let daemon = ServiceDaemon::new()?;
         let hostname = crate::session::hostname();
         let safe_name: String = hostname
             .chars()
             .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
             .collect();
-        let name = format!("oto-{code}-{}", &session.simple().to_string()[..8]);
-        let properties = HashMap::from([
-            ("code".to_string(), code.to_string()),
+        let name = format!("oto-{}", session.simple());
+        let mut properties = HashMap::from([
             ("session".into(), session.to_string()),
             ("version".into(), VERSION.to_string()),
         ]);
+        if let Some(code) = code {
+            properties.insert("code".into(), code.to_string());
+        }
         let info = ServiceInfo::new(
             SERVICE,
             &name,

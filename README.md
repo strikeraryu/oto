@@ -28,21 +28,27 @@ Keep `host` and `join` running in their terminals. Ctrl-C or `oto leave` stops t
 
 ```sh
 oto host                         # System audio; default 200ms buffer
+oto host --no-code               # Direct connections without a connection code
+oto host --port 9000             # Override the default TCP port, 47670
 oto host --source tone           # Quiet 440Hz diagnostic tone, no capture permission
 oto host --buffer-ms 300          # More time for Wi-Fi and Bluetooth output buffering
 oto join 7K4P9                   # Bonjour discovery, no IP required
+oto join --host 192.168.1.14      # No-code host; default port 47670
+oto join --host 192.168.1.14:9000 # No-code host with a custom port
 oto status                      # Session, devices, packet and clock statistics
 oto status --json
 oto leave
 oto devices                     # Output names and persistent UIDs
 oto device "JBL Flip 6"          # Exact name or UID; applies to a running session
-oto device default              # Resolve the current macOS default output
+oto device default              # Follow macOS output changes automatically
 oto latency +40ms               # Delay this output by another 40ms
 oto latency                     # Show its saved delay
 oto doctor
 ```
 
-Offsets are saved per explicitly selected output UID. The `default` selection has its own saved offset. Positive offsets add delay: if speaker A is 40ms faster than speaker B, apply `+40ms` on Mac A. Negative offsets consume buffering time; Oto requires at least 50ms to remain. The default buffer is 200ms, configurable from 50–500ms. Select a device again if it disconnects or if you change the system default while a session is running.
+By default, Oto follows the macOS output selection throughout a session. Connect a Bluetooth speaker and select it in macOS Sound settings or Control Center; both hosts and clients switch their local playback automatically. `oto status` shows the new output. Selecting an explicit name or UID with `oto device` pins that output; run `oto device default` to resume following macOS.
+
+Offsets are saved per explicitly selected output UID. The `default` selection has its own saved offset. Positive offsets add delay: if speaker A is 40ms faster than speaker B, apply `+40ms` on Mac A. Negative offsets consume buffering time; Oto requires at least 50ms to remain. The default buffer is 200ms, configurable from 50–500ms.
 
 If Bonjour is blocked by a router, VPN, or firewall:
 
@@ -51,7 +57,16 @@ oto host --port 47670 --code 7K4P9
 oto join 7K4P9 --host 192.168.1.12:47670
 ```
 
-The host's printed control port is TCP. Audio uses a separate dynamically allocated UDP port. Both Macs must be reachable on the LAN; client isolation on guest Wi-Fi prevents this. `--no-discovery` disables the advertisement for direct connections.
+The host uses TCP port **47670** by default. Override it with `--port`; `--port 0` requests a dynamically allocated control port. Audio uses a separate dynamically allocated UDP port. Both Macs must be reachable on the LAN; client isolation on guest Wi-Fi prevents this. `--no-discovery` disables the advertisement for direct connections.
+
+To connect directly without any code:
+
+```sh
+oto host --no-code
+oto join --host 192.168.1.14
+```
+
+`--no-code` generates no connection code and skips the code check. Anyone who can reach that host on the LAN can join. The client must provide `--host` when omitting its code. Code-required hosts still reject connections with a missing or incorrect code. `--no-code` and `--code` cannot be combined.
 
 ## Timing and transport
 

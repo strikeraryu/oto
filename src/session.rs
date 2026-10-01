@@ -62,7 +62,7 @@ fn generate_code() -> String {
 pub struct Status {
     pub role: String,
     pub state: String,
-    pub code: String,
+    pub code: Option<String>,
     pub hostname: String,
     pub control_port: u16,
     pub clients: Vec<String>,
@@ -78,7 +78,13 @@ pub struct Status {
     pub late: u64,
 }
 impl Status {
-    fn new(role: &str, code: String, buffer_ms: u32, output: String, latency_ms: i32) -> Self {
+    fn new(
+        role: &str,
+        code: Option<String>,
+        buffer_ms: u32,
+        output: String,
+        latency_ms: i32,
+    ) -> Self {
         Self {
             role: role.into(),
             state: "starting".into(),
@@ -234,6 +240,22 @@ impl Runtime {
             stop.send_replace(true);
         })
     }
+    fn follow_output_changes(&self, engine: &mut AudioEngine) -> AbortOnDrop<()> {
+        let status = self.status.clone();
+        let mut changes = engine
+            .device_changes
+            .take()
+            .expect("audio device event receiver");
+        AbortOnDrop(tokio::spawn(async move {
+            while let Some(device) = changes.recv().await {
+                let mut status = status.lock().await;
+                if status.output != device.name {
+                    eprintln!("✓ Output changed: {}", device.name);
+                }
+                status.output = device.name;
+            }
+        }))
+    }
 }
 impl Drop for Runtime {
     fn drop(&mut self) {
@@ -245,6 +267,7 @@ pub struct HostOptions {
     pub bind: IpAddr,
     pub port: u16,
     pub code: Option<String>,
+    pub no_code: bool,
     pub buffer_ms: u32,
     pub tone: bool,
     pub headless: bool,
@@ -259,7 +282,7 @@ type Peers = Arc<RwLock<HashMap<Uuid, Peer>>>;
 
 async fn serve_peer(
     stream: TcpStream,
-    code: String,
+    code: Option<String>,
     session: Uuid,
     audio_port: u16,
     buffer_ms: u32,
@@ -279,7 +302,9 @@ async fn serve_peer(
             name,
             udp_port,
         } if version == protocol::VERSION
-            && supplied == code
+            && code
+                .as_ref()
+                .is_none_or(|expected| supplied.as_ref() == Some(expected))
             && udp_port != 0
             && name.len() <= 128 =>
         {
@@ -369,12 +394,22 @@ pub async fn host(options: HostOptions) -> Result<()> {
         !options.headless || options.tone,
         "--headless requires --source tone"
     );
-    let code = options
-        .code
-        .as_deref()
-        .map(normalize_code)
-        .transpose()?
-        .unwrap_or_else(generate_code);
+    ensure!(
+        !options.no_code || options.code.is_none(),
+        "--no-code cannot be combined with --code"
+    );
+    let code = if options.no_code {
+        None
+    } else {
+        Some(
+            options
+                .code
+                .as_deref()
+                .map(normalize_code)
+                .transpose()?
+                .unwrap_or_else(generate_code),
+        )
+    };
     let settings = Settings::load()?;
     ensure!(
         i64::from(options.buffer_ms) + i64::from(settings.latency()) >= 50,
@@ -388,25 +423,37 @@ pub async fn host(options: HostOptions) -> Result<()> {
         settings.latency(),
     ))
     .await?;
-    let tcp = TcpListener::bind(SocketAddr::new(options.bind, options.port)).await?;
+    let tcp = TcpListener::bind(SocketAddr::new(options.bind, options.port))
+        .await
+        .with_context(|| {
+            format!(
+                "Could not bind host port {}. Use --port to choose another port.",
+                options.port
+            )
+        })?;
     let port = tcp.local_addr()?.port();
     let udp = UdpSocket::bind(SocketAddr::new(options.bind, 0)).await?;
     let audio_port = udp.local_addr()?.port();
     let session = Uuid::new_v4();
     let _advertisement = if options.discoverable {
-        Some(discovery::Advertisement::publish(&code, session, port).context("Could not advertise the session over Bonjour; use --no-discovery for a direct connection")?)
+        Some(discovery::Advertisement::publish(code.as_deref(), session, port).context("Could not advertise the session over Bonjour; use --no-discovery for a direct connection")?)
     } else {
         None
     };
     let mut engine =
         AudioEngine::start(!options.tone, settings.device.as_deref(), options.headless).await?;
+    let _output_changes = runtime.follow_output_changes(&mut engine);
     {
         let mut status = runtime.status.lock().await;
         status.output = engine.device.clone();
         status.control_port = port;
         status.state = "streaming".into();
     }
-    eprintln!("\n  OTO 🎵\n\nHosting audio session\nCode: {code}\nControl port: {port}\nOutput: {}\nBuffer: {}ms\n\nWaiting for devices… (Ctrl-C to stop)", engine.device, options.buffer_ms);
+    eprintln!("\n  OTO 🎵\n\nHosting audio session\nCode: {}\nControl port: {port}\nOutput: {}\nBuffer: {}ms", code.as_deref().unwrap_or("not required"), engine.device, options.buffer_ms);
+    if code.is_none() {
+        eprintln!("Connect: oto join --host <HOST_IP>:{port}");
+    }
+    eprintln!("\nWaiting for devices… (Ctrl-C to stop)");
     let signals = runtime.install_signals();
     let peers: Peers = Arc::new(RwLock::new(HashMap::new()));
     let semaphore = Arc::new(Semaphore::new(16));
@@ -472,7 +519,7 @@ pub async fn host(options: HostOptions) -> Result<()> {
 }
 
 pub struct JoinOptions {
-    pub code: String,
+    pub code: Option<String>,
     pub host: Option<SocketAddr>,
     pub headless: bool,
 }
@@ -511,7 +558,14 @@ async fn client_connection(
     let host = if let Some(address) = options.host {
         address
     } else {
-        discovery::find(&options.code, Duration::from_secs(5)).await?
+        discovery::find(
+            options
+                .code
+                .as_deref()
+                .context("A connection code or --host is required")?,
+            Duration::from_secs(5),
+        )
+        .await?
     };
     let stream = tokio::time::timeout(Duration::from_secs(3), TcpStream::connect(host))
         .await
@@ -640,7 +694,11 @@ async fn client_connection(
 }
 
 pub async fn join(mut options: JoinOptions) -> Result<()> {
-    options.code = normalize_code(&options.code)?;
+    options.code = options.code.as_deref().map(normalize_code).transpose()?;
+    ensure!(
+        options.code.is_some() || options.host.is_some(),
+        "A connection code or --host is required"
+    );
     let settings = Settings::load()?;
     let runtime = Runtime::claim(Status::new(
         "client",
@@ -652,10 +710,15 @@ pub async fn join(mut options: JoinOptions) -> Result<()> {
     .await?;
     let mut engine =
         AudioEngine::start(false, settings.device.as_deref(), options.headless).await?;
+    let _output_changes = runtime.follow_output_changes(&mut engine);
     runtime.status.lock().await.output = engine.device.clone();
     eprintln!(
         "\n  OTO 🎵\n\nJoining {}\nOutput: {}\nSearching for host… (Ctrl-C to leave)",
-        options.code, engine.device
+        options
+            .code
+            .clone()
+            .unwrap_or_else(|| options.host.unwrap().to_string()),
+        engine.device
     );
     let signals = runtime.install_signals();
     let mut stop = runtime.stop.subscribe();

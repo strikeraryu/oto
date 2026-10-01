@@ -60,6 +60,7 @@ func nanos(_ ticks: UInt64) -> UInt64 {
 func frameIndex(_ ns: UInt64) -> Int64 {
     Int64(ns / 1_000_000_000) * 48_000 + Int64((ns % 1_000_000_000) * 48_000 / 1_000_000_000)
 }
+let recordLock = NSLock()
 func writeRecord(_ kind: UInt32, _ timestamp: UInt64, _ payload: Data) throws {
     var header = Data()
     var k = kind.littleEndian, length = UInt32(payload.count).littleEndian, t = timestamp.littleEndian
@@ -67,6 +68,7 @@ func writeRecord(_ kind: UInt32, _ timestamp: UInt64, _ payload: Data) throws {
     withUnsafeBytes(of: &length) { header.append(contentsOf: $0) }
     withUnsafeBytes(of: &t) { header.append(contentsOf: $0) }
     header.append(payload)
+    recordLock.lock(); defer { recordLock.unlock() }
     try FileHandle.standardOutput.write(contentsOf: header)
 }
 func exactRead(_ count: Int) throws -> Data? {
@@ -184,6 +186,10 @@ final class Engine {
     var tap: AudioObjectID = 0, aggregate: AudioObjectID = 0, captureProc: AudioDeviceIOProcID?
     var timer: DispatchSourceTimer?
     var device: Device?
+    let controlQueue = DispatchQueue(label: "audio.oto.control")
+    var defaultListener: AudioObjectPropertyListenerBlock?
+    var followsDefault = true
+    var stopping = false
     let writerQueue = DispatchQueue(label: "audio.oto.capture")
     var previous: CapturedFrame?
     var nextSampleNS: Double = 0
@@ -194,15 +200,46 @@ final class Engine {
         let devices = try outputDevices()
         guard let selected = uid == nil ? devices.first(where: { $0.is_default }) : devices.first(where: { $0.uid == uid }) else { throw EngineError("Output device unavailable. Run oto devices and select a connected device.") }
         let format = try property(selected.id, kAudioDevicePropertyStreamFormat, AudioStreamBasicDescription(), scope: kAudioDevicePropertyScopeOutput)
-        guard format.mFormatID == kAudioFormatLinearPCM, format.mFormatFlags & kAudioFormatFlagIsFloat != 0, format.mBitsPerChannel == 32 else { throw EngineError("Output must expose a Float32 PCM format") }
+        guard format.mFormatID == kAudioFormatLinearPCM, format.mFormatFlags & kAudioFormatFlagIsFloat != 0, format.mBitsPerChannel == 32, format.mSampleRate > 0 else { throw EngineError("Output must expose a Float32 PCM format") }
+        followsDefault = uid == nil
+        if selected.id == output && outputProc != nil { device = selected; return }
         stopOutput()
         output = selected.id
         let ring = playback, rate = format.mSampleRate
         try check(AudioDeviceCreateIOProcIDWithBlock(&outputProc, output, nil) { _, _, _, outputData, outputTime in
             ring.render(UnsafeMutableAudioBufferListPointer(outputData), nanos(outputTime.pointee.mHostTime), rate)
         }, "Create playback callback")
-        try check(AudioDeviceStart(output, outputProc), "Start playback")
+        do { try check(AudioDeviceStart(output, outputProc), "Start playback") }
+        catch { stopOutput(); throw error }
         device = selected
+    }
+    func reportDevice() throws {
+        if let device = device { try writeRecord(11, 0, JSONEncoder().encode(device)) }
+    }
+    func watchDefaultOutput() throws {
+        var addr = address(kAudioHardwarePropertyDefaultOutputDevice)
+        let listener: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
+            self?.refreshDefaultOutput()
+        }
+        try check(AudioObjectAddPropertyListenerBlock(AudioObjectID(kAudioObjectSystemObject), &addr, controlQueue, listener), "Watch system output changes")
+        defaultListener = listener
+    }
+    func refreshDefaultOutput(attempt: Int = 0) {
+        guard followsDefault && !stopping else { return }
+        do {
+            let oldOutput = output
+            try startOutput(nil)
+            if oldOutput != output { try reportDevice() }
+        } catch {
+            // Bluetooth route transitions can briefly expose no usable default.
+            if attempt < 8 {
+                controlQueue.asyncAfter(deadline: .now() + .milliseconds(250)) { [weak self] in
+                    self?.refreshDefaultOutput(attempt: attempt + 1)
+                }
+            } else {
+                FileHandle.standardError.write(Data("Oto audio: could not follow system output: \(error)\n".utf8))
+            }
+        }
     }
     func startCapture() throws {
         // Output is already running, so this process has a Core Audio process ID.
@@ -269,6 +306,12 @@ final class Engine {
         outputProc = nil
     }
     func stop() {
+        stopping = true
+        if let listener = defaultListener {
+            var addr = address(kAudioHardwarePropertyDefaultOutputDevice)
+            AudioObjectRemovePropertyListenerBlock(AudioObjectID(kAudioObjectSystemObject), &addr, controlQueue, listener)
+            defaultListener = nil
+        }
         timer?.cancel(); timer = nil
         if let proc = captureProc { AudioDeviceStop(aggregate, proc); AudioDeviceDestroyIOProcID(aggregate, proc) }
         captureProc = nil
@@ -277,11 +320,15 @@ final class Engine {
         stopOutput()
     }
     func run(capturing: Bool, uid: String?) throws {
-        try startOutput(uid)
-        // Ready must precede capture packets on stdout.
-        try writeRecord(11, 0, JSONEncoder().encode(device!))
-        if capturing { try startCapture() }
-        defer { stop() }
+        defer { controlQueue.sync { stop() } }
+        try controlQueue.sync {
+            try startOutput(uid)
+            // Ready must precede capture packets on stdout.
+            try reportDevice()
+            try watchDefaultOutput()
+            if capturing { try startCapture() }
+            refreshDefaultOutput()
+        }
         while let header = try exactRead(16) {
             let kind = u32(header, 0), count = Int(u32(header, 4)), time = u64(header, 8)
             guard count <= 4096, let data = try exactRead(count) else { throw EngineError("Invalid engine input frame") }
@@ -291,7 +338,10 @@ final class Engine {
                 playback.enqueue(time, data)
             case 2:
                 let uid = String(data: data, encoding: .utf8)
-                try startOutput(uid?.isEmpty == true ? nil : uid)
+                try controlQueue.sync {
+                    try startOutput(uid?.isEmpty == true ? nil : uid)
+                    try reportDevice()
+                }
             case 3: return
             default: throw EngineError("Unknown engine command")
             }

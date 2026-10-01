@@ -4,6 +4,7 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
 use uuid::Uuid;
 
 pub const VERSION: u8 = 1;
+pub const DEFAULT_PORT: u16 = 47670;
 pub const RATE: u32 = 48_000;
 pub const CHANNELS: u8 = 2;
 pub const FRAMES: u16 = 240; // 5 ms; 1,024 bytes including header, below LAN MTU.
@@ -16,7 +17,8 @@ pub const SERVICE: &str = "_oto._tcp.local.";
 pub enum Control {
     Hello {
         version: u8,
-        code: String,
+        #[serde(default)]
+        code: Option<String>,
         name: String,
         udp_port: u16,
     },
@@ -137,6 +139,28 @@ impl AudioPacket {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn hello_supports_existing_codes_and_no_code() {
+        for (json, expected) in [
+            (
+                r#"{"type":"hello","version":1,"code":"AB234","name":"Mac","udp_port":9000}"#,
+                Some("AB234"),
+            ),
+            (
+                r#"{"type":"hello","version":1,"name":"Mac","udp_port":9000}"#,
+                None,
+            ),
+            (
+                r#"{"type":"hello","version":1,"code":null,"name":"Mac","udp_port":9000}"#,
+                None,
+            ),
+        ] {
+            let Control::Hello { code, .. } = serde_json::from_str(json).unwrap() else {
+                panic!("expected hello")
+            };
+            assert_eq!(code.as_deref(), expected);
+        }
+    }
     #[test]
     fn validates_wire_format_and_session() {
         let p = AudioPacket {

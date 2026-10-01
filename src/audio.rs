@@ -78,6 +78,7 @@ pub struct AudioEngine {
     pub sender: mpsc::Sender<CommandFrame>,
     pub captures: mpsc::Receiver<Capture>,
     pub errors: mpsc::Receiver<String>,
+    pub device_changes: Option<mpsc::Receiver<Device>>,
     tasks: Vec<tokio::task::JoinHandle<()>>,
     pub device: String,
 }
@@ -115,9 +116,10 @@ impl AudioEngine {
         let (sender, mut input) = mpsc::channel(128);
         let (capture_tx, captures) = mpsc::channel(32);
         let (error_tx, errors) = mpsc::channel(4);
+        let (device_tx, device_changes) = mpsc::channel(8);
         if headless {
             let task = tokio::spawn(async move {
-                let _keep_channels_open = (capture_tx, error_tx);
+                let _keep_channels_open = (capture_tx, error_tx, device_tx);
                 while input.recv().await.is_some() {}
             });
             return Ok(Self {
@@ -125,6 +127,7 @@ impl AudioEngine {
                 sender,
                 captures,
                 errors,
+                device_changes: Some(device_changes),
                 tasks: vec![task],
                 device: "headless".into(),
             });
@@ -160,6 +163,11 @@ impl AudioEngine {
                     Ok((10, timestamp, pcm)) if pcm.len() == crate::protocol::PAYLOAD => {
                         let _ = capture_tx.try_send(Capture { timestamp, pcm });
                     }
+                    Ok((11, _, bytes)) => {
+                        if let Ok(device) = serde_json::from_slice::<Device>(&bytes) {
+                            let _ = device_tx.try_send(device);
+                        }
+                    }
                     Ok(_) => {}
                     Err(error) => {
                         let _ = error_tx.send(error.to_string()).await;
@@ -173,6 +181,7 @@ impl AudioEngine {
             sender,
             captures,
             errors,
+            device_changes: Some(device_changes),
             tasks: vec![writer, reader],
             device: device.name,
         })
