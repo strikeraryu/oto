@@ -15,11 +15,6 @@ pub struct Advertisement {
 impl Advertisement {
     pub fn publish(code: Option<&str>, session: Uuid, port: u16) -> Result<Self> {
         let daemon = ServiceDaemon::new()?;
-        let hostname = crate::session::hostname();
-        let safe_name: String = hostname
-            .chars()
-            .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
-            .collect();
         let name = format!("oto-{}", session.simple());
         let mut properties = HashMap::from([
             ("session".into(), session.to_string()),
@@ -31,14 +26,8 @@ impl Advertisement {
         let info = ServiceInfo::new(
             SERVICE,
             &name,
-            &format!(
-                "{}.local.",
-                if safe_name.is_empty() {
-                    "oto-host"
-                } else {
-                    &safe_name
-                }
-            ),
+            // A private alias avoids claiming macOS's own Bonjour hostname.
+            &format!("{name}.local."),
             "",
             port,
             properties,

@@ -209,14 +209,14 @@ impl Runtime {
                                     config.set_latency(ms); config.save()?;
                                     status.lock().await.latency_ms = ms;
                                 },
-                                LocalCommand::Device { uid, name } => {
+                                LocalCommand::Device { uid, name: _ } => {
                                     let mut config = config.write().await;
                                     let mut next = config.clone(); next.device = uid.clone();
                                     ensure!(i64::from(status.lock().await.buffer_ms) + i64::from(next.latency()) >= 50, "Saved device offset leaves less than 50ms of buffering");
                                     sender.send(CommandFrame::Device(uid.unwrap_or_default())).await.context("Audio engine stopped")?;
                                     next.save()?; *config = next;
                                     let mut status = status.lock().await;
-                                    status.output = name; status.latency_ms = config.latency();
+                                    status.latency_ms = config.latency();
                                 }
                             }
                             Ok(LocalResponse { ok: true, message: "OK".into(), status: Some(status.lock().await.clone()) })
@@ -442,13 +442,13 @@ pub async fn host(options: HostOptions) -> Result<()> {
     };
     let mut engine =
         AudioEngine::start(!options.tone, settings.device.as_deref(), options.headless).await?;
-    let _output_changes = runtime.follow_output_changes(&mut engine);
     {
         let mut status = runtime.status.lock().await;
         status.output = engine.device.clone();
         status.control_port = port;
         status.state = "streaming".into();
     }
+    let _output_changes = runtime.follow_output_changes(&mut engine);
     eprintln!("\n  OTO 🎵\n\nHosting audio session\nCode: {}\nControl port: {port}\nOutput: {}\nBuffer: {}ms", code.as_deref().unwrap_or("not required"), engine.device, options.buffer_ms);
     if code.is_none() {
         eprintln!("Connect: oto join --host <HOST_IP>:{port}");
@@ -710,8 +710,8 @@ pub async fn join(mut options: JoinOptions) -> Result<()> {
     .await?;
     let mut engine =
         AudioEngine::start(false, settings.device.as_deref(), options.headless).await?;
-    let _output_changes = runtime.follow_output_changes(&mut engine);
     runtime.status.lock().await.output = engine.device.clone();
+    let _output_changes = runtime.follow_output_changes(&mut engine);
     eprintln!(
         "\n  OTO 🎵\n\nJoining {}\nOutput: {}\nSearching for host… (Ctrl-C to leave)",
         options

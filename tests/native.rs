@@ -34,16 +34,25 @@ async fn native_playback_switches_output_and_cleans_up_on_eof() {
     let device = read_device(&mut stdout).await;
     assert!(device.sample_rate > 0.);
     assert!(!device.uid.is_empty());
-    // Pin the currently connected device, then restore automatic default
+    let outputs = audio::devices().await.unwrap();
+    let pinned_uid = outputs
+        .iter()
+        .find(|output| output.uid != device.uid)
+        .map(|output| output.uid.as_str())
+        .unwrap_or(&device.uid);
+    // Pin another connected output when available, then restore automatic default
     // following. Both commands must acknowledge the actual native output.
-    for uid in [device.uid.as_bytes(), b""] {
+    for (uid, expected) in [
+        (pinned_uid.as_bytes(), pinned_uid),
+        (b"".as_slice(), device.uid.as_str()),
+    ] {
         let mut command = Vec::new();
         command.extend_from_slice(&2u32.to_le_bytes());
         command.extend_from_slice(&(uid.len() as u32).to_le_bytes());
         command.extend_from_slice(&0u64.to_le_bytes());
         command.extend_from_slice(uid);
         stdin.write_all(&command).await.unwrap();
-        assert_eq!(read_device(&mut stdout).await.uid, device.uid);
+        assert_eq!(read_device(&mut stdout).await.uid, expected);
     }
     drop(stdin);
     assert!(tokio::time::timeout(Duration::from_secs(5), child.wait())
