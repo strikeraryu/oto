@@ -1,0 +1,50 @@
+name: Release
+on:
+  push:
+    tags: ['v*']
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: macos-14
+    strategy:
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            arch: arm64
+          - target: x86_64-apple-darwin
+            arch: x86_64
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - run: cargo build --locked --release --target ${{ matrix.target }}
+      - name: Archive
+        run: |
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/oto dist/oto
+          tar -czf oto-darwin-${{ matrix.arch }}.tar.gz -C dist oto
+      - uses: actions/upload-artifact@v4
+        with:
+          name: oto-darwin-${{ matrix.arch }}
+          path: oto-darwin-${{ matrix.arch }}.tar.gz
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          OTO_TAG: ${{ github.ref_name }}
+        run: |
+          cd dist
+          sha256sum oto-darwin-*.tar.gz > checksums.txt
+          gh release create "$OTO_TAG" --verify-tag --generate-notes oto-darwin-*.tar.gz checksums.txt
