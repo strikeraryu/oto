@@ -58,6 +58,22 @@ fn generate_code() -> String {
         .collect()
 }
 
+fn host_addresses(bind: IpAddr, port: u16) -> Result<Vec<SocketAddr>> {
+    if !bind.is_unspecified() {
+        return Ok(vec![SocketAddr::new(bind, port)]);
+    }
+    let mut addresses = if_addrs::get_if_addrs()?
+        .into_iter()
+        .filter(|interface| !interface.is_loopback() && !interface.is_link_local())
+        .map(|interface| interface.ip())
+        .filter(|ip| !ip.is_unspecified() && ip.is_ipv4() == bind.is_ipv4())
+        .map(|ip| SocketAddr::new(ip, port))
+        .collect::<Vec<_>>();
+    addresses.sort_unstable();
+    addresses.dedup();
+    Ok(addresses)
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Status {
     pub role: String,
@@ -65,6 +81,8 @@ pub struct Status {
     pub code: Option<String>,
     pub hostname: String,
     pub control_port: u16,
+    #[serde(default)]
+    pub addresses: Vec<SocketAddr>,
     pub clients: Vec<String>,
     pub output: String,
     pub latency_ms: i32,
@@ -91,6 +109,7 @@ impl Status {
             code,
             hostname: hostname(),
             control_port: 0,
+            addresses: vec![],
             clients: vec![],
             output,
             latency_ms,
@@ -432,6 +451,13 @@ pub async fn host(options: HostOptions) -> Result<()> {
             )
         })?;
     let port = tcp.local_addr()?.port();
+    let addresses = match host_addresses(options.bind, port) {
+        Ok(addresses) => addresses,
+        Err(error) => {
+            eprintln!("Could not list host IP addresses: {error}");
+            vec![]
+        }
+    };
     let udp = UdpSocket::bind(SocketAddr::new(options.bind, 0)).await?;
     let audio_port = udp.local_addr()?.port();
     let session = Uuid::new_v4();
@@ -446,12 +472,19 @@ pub async fn host(options: HostOptions) -> Result<()> {
         let mut status = runtime.status.lock().await;
         status.output = engine.device.clone();
         status.control_port = port;
+        status.addresses = addresses.clone();
         status.state = "streaming".into();
     }
     let _output_changes = runtime.follow_output_changes(&mut engine);
     eprintln!("\n  OTO 🎵\n\nHosting audio session\nCode: {}\nControl port: {port}\nOutput: {}\nBuffer: {}ms", code.as_deref().unwrap_or("not required"), engine.device, options.buffer_ms);
-    if code.is_none() {
-        eprintln!("Connect: oto join --host <HOST_IP>:{port}");
+    for address in addresses {
+        eprintln!(
+            "Host IP: {}\nConnect: oto join{} --host {address}",
+            address.ip(),
+            code.as_ref()
+                .map(|code| format!(" {code}"))
+                .unwrap_or_default()
+        );
     }
     eprintln!("\nWaiting for devices… (Ctrl-C to stop)");
     let signals = runtime.install_signals();
@@ -625,6 +658,7 @@ async fn client_connection(
         status.state = "playing".into();
         status.buffer_ms = buffer_ms;
         status.control_port = host.port();
+        status.addresses = vec![host];
         status.clock_offset_ms = best.offset_ns as f64 / 1_000_000.;
         status.rtt_ms = best.rtt_ns as f64 / 1_000_000.;
     }

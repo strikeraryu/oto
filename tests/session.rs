@@ -30,6 +30,17 @@ fn start(directory: &Path, args: &[&str]) -> Process {
             .unwrap(),
     )
 }
+fn start_logged(directory: &Path, args: &[&str]) -> Process {
+    let log = std::fs::File::create(directory.join("session.log")).unwrap();
+    Process(
+        command(directory)
+            .args(args)
+            .stdout(Stdio::null())
+            .stderr(log)
+            .spawn()
+            .unwrap(),
+    )
+}
 fn status(directory: &Path) -> Option<Value> {
     let output = command(directory)
         .args(["status", "--json"])
@@ -70,7 +81,7 @@ fn multi_client_session_controls_and_reconnection() {
     let host = TempDir::new().unwrap();
     let client = TempDir::new().unwrap();
     let second = TempDir::new().unwrap();
-    let mut server = start(
+    let mut server = start_logged(
         host.path(),
         &[
             "host",
@@ -89,6 +100,10 @@ fn multi_client_session_controls_and_reconnection() {
     let host_status = wait_for(host.path(), |s| s["state"] == "streaming");
     let port = host_status["control_port"].as_u64().unwrap();
     let address = format!("127.0.0.1:{port}");
+    assert_eq!(host_status["addresses"], serde_json::json!([address]));
+    let log = std::fs::read_to_string(host.path().join("session.log")).unwrap();
+    assert!(log.contains("Host IP: 127.0.0.1"));
+    assert!(log.contains(&format!("Connect: oto join AB234 --host {address}")));
     let _client = start(
         client.path(),
         &["join", "ab234", "--host", &address, "--headless"],
@@ -216,7 +231,7 @@ fn bonjour_discovers_a_code_without_an_ip() {
 fn direct_session_without_a_code() {
     let host = TempDir::new().unwrap();
     let client = TempDir::new().unwrap();
-    let _server = start(
+    let _server = start_logged(
         host.path(),
         &[
             "host",
@@ -234,6 +249,10 @@ fn direct_session_without_a_code() {
     let stats = wait_for(host.path(), |s| s["state"] == "streaming");
     assert!(stats["code"].is_null());
     let address = format!("127.0.0.1:{}", stats["control_port"].as_u64().unwrap());
+    assert_eq!(stats["addresses"], serde_json::json!([address]));
+    let log = std::fs::read_to_string(host.path().join("session.log")).unwrap();
+    assert!(log.contains("Host IP: 127.0.0.1"));
+    assert!(log.contains(&format!("Connect: oto join --host {address}")));
     let _client = start(client.path(), &["join", "--host", &address, "--headless"]);
     let stats = wait_for(client.path(), |s| s["scheduled"].as_u64().unwrap_or(0) > 50);
     assert!(stats["code"].is_null());

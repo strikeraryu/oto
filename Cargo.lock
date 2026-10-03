@@ -360,6 +360,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "if-addrs",
  "libc",
  "mdns-sd",
  "serde",

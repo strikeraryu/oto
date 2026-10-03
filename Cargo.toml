@@ -10,6 +10,7 @@ build = "build.rs"
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
+if-addrs = "0.13"
 libc = "0.2"
 mdns-sd = "0.13"
 serde = { version = "1", features = ["derive"] }
@@ -24,4 +25,3 @@ tempfile = "3"
 [profile.release]
 lto = "thin"
 strip = true
-

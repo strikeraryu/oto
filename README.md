@@ -14,7 +14,7 @@ cargo build --release
 ./target/release/oto host
 ```
 
-The host prints a five-character code. On another Mac:
+The host prints its local IP address, TCP port, a five-character code, and a copyable join command. On another Mac:
 
 ```sh
 oto join 7K4P9

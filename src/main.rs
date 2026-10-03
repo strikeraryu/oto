@@ -159,6 +159,9 @@ async fn run() -> Result<()> {
                     println!("{}", serde_json::to_string_pretty(&status)?);
                 } else {
                     println!("{}: {}\nCode: {}\nControl port: {}\nOutput: {}\nBuffer: {}ms | Offset: {:+}ms\nClock offset: {:.3}ms | RTT: {:.3}ms\nClients: {}\nPackets sent: {} | Received: {} | Scheduled: {}\nMissing: {} | Late: {}", status.role, status.state, status.code.as_deref().unwrap_or("not required"), status.control_port, status.output, status.buffer_ms, status.latency_ms, status.clock_offset_ms, status.rtt_ms, status.clients.join(", "), status.sent, status.received, status.scheduled, status.missing, status.late);
+                    for address in status.addresses {
+                        println!("Host address: {address}");
+                    }
                 }
             }
         }
