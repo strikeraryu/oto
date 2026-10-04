@@ -24,6 +24,8 @@ jobs:
         run: |
           mkdir -p dist
           cp target/${{ matrix.target }}/release/oto dist/oto
+          codesign --force --sign - --identifier audio.oto.cli dist/oto
+          codesign --verify --strict dist/oto
           tar -czf oto-darwin-${{ matrix.arch }}.tar.gz -C dist oto
       - uses: actions/upload-artifact@v4
         with:
@@ -35,6 +37,7 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           path: dist
@@ -45,6 +48,7 @@ jobs:
           GH_REPO: ${{ github.repository }}
           OTO_TAG: ${{ github.ref_name }}
         run: |
+          cp install.sh dist/install.sh
           cd dist
-          sha256sum oto-darwin-*.tar.gz > checksums.txt
-          gh release create "$OTO_TAG" --verify-tag --generate-notes oto-darwin-*.tar.gz checksums.txt
+          sha256sum oto-darwin-*.tar.gz install.sh > checksums.txt
+          gh release create "$OTO_TAG" --verify-tag --title "Oto $OTO_TAG" --notes-file ../.github/release-notes.md --generate-notes oto-darwin-*.tar.gz checksums.txt install.sh

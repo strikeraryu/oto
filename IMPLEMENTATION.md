@@ -12,7 +12,14 @@ This implementation follows the MVP in `DESIGN.MD`, with the following concrete 
 - `host` and `join` stay in the foreground. A private Unix socket supplies status, leave and live settings commands. SIGINT/SIGTERM and pipe EOF stop the helper and destroy its private tap/aggregate objects.
 - The short code is advertised and is not a secret. Per-connection random tokens prevent accidental cross-session audio. Transport is plaintext and intended for a trusted LAN. Cryptographic peer authentication/encryption needs a separate pairing design.
 - Connection loss triggers discovery, a new handshake/token, fresh clock synchronization, and buffer refill. The first release supports up to 16 clients and fixed buffering. Acoustic calibration, adaptive buffering and Opus are deferred as described in the product scope.
-- Release automation produces arm64 and x86_64 archives with SHA-256 checksums. The installer requires a real GitHub release repository; no placeholder domain is presented as an operational download endpoint.
+- Release automation produces ad-hoc signed arm64 and x86_64 archives with SHA-256 checksums and attaches `install.sh` to the release. The one-command installer defaults to `strikeraryu/oto`, resolves latest to an immutable tag, validates the checksum and runnable binary, and atomically installs into `~/.local/bin` without sudo. It configures zsh/bash login PATH with an opt-out and supports pinned versions and custom installation directories.
+
+## Quick installation (2026-10-04)
+
+- The README and release notes expose the release-hosted one-command installer. Binary installation does not require Rust or Xcode; `oto` opens the TUI after the shell PATH is available.
+- The installer performs all mutations inside a final function invocation so a truncated script fails to parse before installation starts. It validates input, restricts downloads/redirects to HTTPS, uses bounded curl retries/timeouts, and cleans up temporary/staged files on failure or signals.
+- Existing installations are replaced only after checksum verification and a successful `--version` invocation of the downloaded binary. PATH lines escape shell metacharacters and are not duplicated; bash's existing login profile takes precedence. `--no-modify-path` supports managed shell environments.
+- The release workflow signs/verifies each main binary, builds both architecture archives, and publishes the installer and checksum list from the tagged source alongside the binaries.
 
 ## Terminal interface (2026-10-04)
 

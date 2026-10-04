@@ -4,7 +4,23 @@ Oto streams a Mac's system audio to other Macs on the same local network. The ho
 
 Requires **macOS 14.2 or later**. The CLI is Rust; a bundled Swift helper uses Core Audio process taps and hardware playback callbacks. No virtual audio driver is required.
 
-## Build and run
+## Quick install
+
+On each Mac, run:
+
+```sh
+curl -fsSL https://github.com/strikeraryu/oto/releases/latest/download/install.sh | sh
+```
+
+No Rust, Xcode, or sudo is required. The installer selects Apple Silicon or Intel, verifies the release checksum, and installs into `~/.local/bin`. It adds that directory to your zsh or bash login profile if needed. Open a new terminal, or run the PATH command printed by the installer, then:
+
+```sh
+oto
+```
+
+The TUI lets you host or join. Run `oto doctor` to check audio support. Rerun the installation command to upgrade, then restart Oto on every participating Mac.
+
+## Build from source
 
 Install Rust and Xcode Command Line Tools, then:
 
@@ -110,16 +126,22 @@ Bluetooth speakers add device-dependent acoustic delay. Oto coordinates compensa
 
 ## Installation and releases
 
-Until a release repository is configured, build locally or run `cargo install --path .`. The release workflow builds archives for Apple Silicon and Intel, each containing one `oto` binary with its audio helper embedded. Release assets include SHA-256 checksums.
+The [GitHub releases](https://github.com/strikeraryu/oto/releases) contain Apple Silicon and Intel archives, the installer, and SHA-256 checksums. The audio helper is embedded in the binary. By default the installer resolves the latest release once and downloads its archive and checksum from that same version.
 
-Once you publish a tagged release in your GitHub repository:
+Options:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/OWNER/REPO/main/install.sh -o /tmp/oto-install.sh
-OTO_REPOSITORY=OWNER/REPO sh /tmp/oto-install.sh
+# Select a version:
+curl -fsSL https://github.com/strikeraryu/oto/releases/latest/download/install.sh | sh -s -- --version v0.1.0
+# Keep shell profiles unchanged:
+curl -fsSL https://github.com/strikeraryu/oto/releases/latest/download/install.sh | sh -s -- --no-modify-path
+# Select another installation directory:
+curl -fsSL https://github.com/strikeraryu/oto/releases/latest/download/install.sh | sh -s -- --install-dir "$HOME/bin"
 ```
 
-The installer verifies the archive against the release checksum list and installs into `~/.local/bin`. It prints the PATH setup command if needed. `OTO_VERSION=v0.1.0` selects a version; `OTO_INSTALL_DIR` selects an installation directory. A production distribution still needs a stable repository/domain and Developer ID signing/notarization. Development builds ad-hoc sign the audio helper and embed the audio-capture usage description.
+You can download `install.sh` first and run `sh install.sh --help`. Environment overrides `OTO_VERSION`, `OTO_INSTALL_DIR`, `OTO_NO_MODIFY_PATH=1`, and `OTO_REPOSITORY` are also supported. Set them on the `sh` side of a pipeline. The installer checks the downloaded binary before replacing an existing installation and uses an atomic rename; your speaker settings remain in `~/Library/Application Support/Oto`.
+
+To uninstall, remove `~/.local/bin/oto` (or the binary in your chosen installation directory). Saved settings are retained. Release binaries and their helper are ad-hoc signed; Developer ID signing and notarization are not configured.
 
 ## Development and checks
 
