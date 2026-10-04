@@ -76,6 +76,8 @@ fn host_addresses(bind: IpAddr, port: u16) -> Result<Vec<SocketAddr>> {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Status {
+    #[serde(default)]
+    pub pid: u32,
     pub role: String,
     pub state: String,
     pub code: Option<String>,
@@ -85,7 +87,20 @@ pub struct Status {
     pub addresses: Vec<SocketAddr>,
     pub clients: Vec<String>,
     pub output: String,
+    #[serde(default)]
+    pub output_uid: Option<String>,
+    #[serde(default = "default_true")]
+    pub follow_default: bool,
     pub latency_ms: i32,
+    /// Slowest reported physical output delay among current participants.
+    #[serde(default)]
+    pub target_delay_ms: u32,
+    /// Automatic additional software delay for this participant.
+    #[serde(default)]
+    pub compensation_ms: u32,
+    /// Local report last acknowledged by the host (or applied locally as host).
+    #[serde(default)]
+    pub applied_delay_ms: u32,
     pub buffer_ms: u32,
     pub clock_offset_ms: f64,
     pub rtt_ms: f64,
@@ -94,6 +109,9 @@ pub struct Status {
     pub scheduled: u64,
     pub missing: u64,
     pub late: u64,
+}
+fn default_true() -> bool {
+    true
 }
 impl Status {
     fn new(
@@ -104,6 +122,7 @@ impl Status {
         latency_ms: i32,
     ) -> Self {
         Self {
+            pid: std::process::id(),
             role: role.into(),
             state: "starting".into(),
             code,
@@ -112,7 +131,12 @@ impl Status {
             addresses: vec![],
             clients: vec![],
             output,
+            output_uid: None,
+            follow_default: true,
             latency_ms,
+            target_delay_ms: 0,
+            compensation_ms: 0,
+            applied_delay_ms: 0,
             buffer_ms,
             clock_offset_ms: 0.,
             rtt_ms: 0.,
@@ -130,8 +154,20 @@ impl Status {
 pub enum LocalCommand {
     Status,
     Leave,
-    Latency { ms: i32 },
-    Device { uid: Option<String>, name: String },
+    Latency {
+        ms: i32,
+    },
+    AdjustLatency {
+        delta_ms: i32,
+        output_uid: Option<String>,
+    },
+    ResetLatency {
+        output_uid: Option<String>,
+    },
+    Device {
+        uid: Option<String>,
+        name: String,
+    },
 }
 #[derive(Serialize, Deserialize)]
 pub struct LocalResponse {
@@ -158,6 +194,7 @@ struct Runtime {
     status: Arc<Mutex<Status>>,
     config: Arc<RwLock<Settings>>,
     stop: watch::Sender<bool>,
+    delay_changes: watch::Sender<u64>,
     listener: UnixListener,
     path: std::path::PathBuf,
     _lock: std::fs::File,
@@ -190,10 +227,12 @@ impl Runtime {
         let listener = UnixListener::bind(&path)?;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
         let (stop, _) = watch::channel(false);
+        let (delay_changes, _) = watch::channel(0);
         Ok(Self {
             status: Arc::new(Mutex::new(status)),
             config: Arc::new(RwLock::new(Settings::load()?)),
             stop,
+            delay_changes,
             listener,
             path,
             _lock: lock,
@@ -212,6 +251,7 @@ impl Runtime {
                     let status = self.status.clone();
                     let config = self.config.clone();
                     let shutdown = self.stop.clone();
+                    let delay_changes = self.delay_changes.clone();
                     let sender = sender.clone();
                     requests.spawn(async move {
                         let (read, mut write) = stream.into_split();
@@ -221,21 +261,44 @@ impl Runtime {
                             match command {
                                 LocalCommand::Status => {},
                                 LocalCommand::Leave => { leaving = true; },
-                                LocalCommand::Latency { ms } => {
-                                    ensure!((-500..=500).contains(&ms), "Latency must be between -500ms and +500ms");
-                                    ensure!(i64::from(status.lock().await.buffer_ms) + i64::from(ms) >= 50, "Increase --buffer-ms before applying this negative offset (at least 50ms must remain)");
+                                command @ (LocalCommand::Latency { .. } | LocalCommand::AdjustLatency { .. } | LocalCommand::ResetLatency { .. }) => {
                                     let mut config = config.write().await;
-                                    config.set_latency(ms); config.save()?;
-                                    status.lock().await.latency_ms = ms;
+                                    let mut current = status.lock().await;
+                                    let ms = match command {
+                                        LocalCommand::Latency { ms } => ms,
+                                        LocalCommand::AdjustLatency { delta_ms, output_uid } => {
+                                            ensure!(output_uid == current.output_uid, "Output changed; try the adjustment again on the current speaker");
+                                            config.latency().checked_add(delta_ms).context("Latency adjustment is too large")?
+                                        },
+                                        LocalCommand::ResetLatency { output_uid } => {
+                                            ensure!(output_uid == current.output_uid, "Output changed; try resetting the current speaker again");
+                                            0
+                                        },
+                                        _ => unreachable!(),
+                                    };
+                                    ensure!((0..=500).contains(&ms), "Speaker delay must be between 0 and 500 ms");
+                                    let mut next = config.clone(); next.set_latency(ms); next.save()?; *config = next;
+                                    current.latency_ms = ms;
+                                    delay_changes.send_modify(|revision| *revision = revision.wrapping_add(1));
                                 },
                                 LocalCommand::Device { uid, name: _ } => {
+                                    let outputs = crate::audio::devices().await?;
+                                    let selected = outputs.iter().find(|device| match &uid { Some(uid) => &device.uid == uid, None => device.is_default }).context("Selected output is unavailable")?;
                                     let mut config = config.write().await;
-                                    let mut next = config.clone(); next.device = uid.clone();
-                                    ensure!(i64::from(status.lock().await.buffer_ms) + i64::from(next.latency()) >= 50, "Saved device offset leaves less than 50ms of buffering");
+                                    let mut next = config.clone(); next.device = uid.clone(); next.activate_output(Some(selected.uid.clone()));
+                                    let follow_default = uid.is_none();
                                     sender.send(CommandFrame::Device(uid.unwrap_or_default())).await.context("Audio engine stopped")?;
-                                    next.save()?; *config = next;
-                                    let mut status = status.lock().await;
-                                    status.latency_ms = config.latency();
+                                    // The engine's acknowledgement commits the active UID and report.
+                                    let mut saved = config.clone(); saved.device = next.device; saved.save()?; *config = saved;
+                                    drop(config);
+                                    tokio::time::timeout(Duration::from_secs(2), async {
+                                        loop {
+                                            { let current = status.lock().await;
+                                              if current.output_uid.as_deref() == Some(selected.uid.as_str()) && current.follow_default == follow_default { break; }
+                                            }
+                                            tokio::time::sleep(Duration::from_millis(10)).await;
+                                        }
+                                    }).await.context("Output did not acknowledge the change; check session logs")?;
                                 }
                             }
                             Ok(LocalResponse { ok: true, message: "OK".into(), status: Some(status.lock().await.clone()) })
@@ -261,19 +324,38 @@ impl Runtime {
     }
     fn follow_output_changes(&self, engine: &mut AudioEngine) -> AbortOnDrop<()> {
         let status = self.status.clone();
+        let config = self.config.clone();
+        let delay_changes = self.delay_changes.clone();
         let mut changes = engine
             .device_changes
             .take()
             .expect("audio device event receiver");
         AbortOnDrop(tokio::spawn(async move {
             while let Some(device) = changes.recv().await {
+                let mut config = config.write().await;
+                config.activate_output(Some(device.uid.clone()));
                 let mut status = status.lock().await;
+                status.latency_ms = config.latency();
+                status.output_uid = Some(device.uid);
+                status.follow_default = config.device.is_none();
                 if status.output != device.name {
                     eprintln!("✓ Output changed: {}", device.name);
                 }
                 status.output = device.name;
+                delay_changes.send_modify(|revision| *revision = revision.wrapping_add(1));
             }
         }))
+    }
+    async fn initialize_output(&self, engine: &AudioEngine) -> Result<()> {
+        let mut config = self.config.write().await;
+        config.activate_output(engine.device_uid.clone());
+        config.save()?;
+        let mut status = self.status.lock().await;
+        status.output = engine.device.clone();
+        status.output_uid = engine.device_uid.clone();
+        status.follow_default = config.device.is_none();
+        status.latency_ms = config.latency();
+        Ok(())
     }
 }
 impl Drop for Runtime {
@@ -296,8 +378,63 @@ struct Peer {
     address: SocketAddr,
     token: Uuid,
     name: String,
+    speaker_delay_ms: u32,
 }
 type Peers = Arc<RwLock<HashMap<Uuid, Peer>>>;
+
+#[derive(Clone)]
+struct Coordinator {
+    peers: Peers,
+    config: Arc<RwLock<Settings>>,
+    status: Arc<Mutex<Status>>,
+}
+struct PeerOutput {
+    address: SocketAddr,
+    token: Uuid,
+    speaker_delay_ms: u32,
+}
+struct PlaybackPlan {
+    local_delay_ms: u32,
+    target_delay_ms: u32,
+    outputs: Vec<PeerOutput>,
+}
+impl Coordinator {
+    async fn plan(&self) -> PlaybackPlan {
+        let config = self.config.read().await;
+        let local_delay_ms = config.latency() as u32;
+        let peers = self.peers.read().await;
+        let target_delay_ms = peers
+            .values()
+            .map(|peer| peer.speaker_delay_ms)
+            .max()
+            .unwrap_or(0)
+            .max(local_delay_ms);
+        let outputs = peers
+            .values()
+            .map(|peer| PeerOutput {
+                address: peer.address,
+                token: peer.token,
+                speaker_delay_ms: peer.speaker_delay_ms,
+            })
+            .collect();
+        PlaybackPlan {
+            local_delay_ms,
+            target_delay_ms,
+            outputs,
+        }
+    }
+    async fn refresh_clients(&self) {
+        let mut names = self
+            .peers
+            .read()
+            .await
+            .values()
+            .map(|peer| peer.name.clone())
+            .collect::<Vec<_>>();
+        names.sort();
+        self.status.lock().await.clients = names;
+    }
+}
 
 async fn serve_peer(
     stream: TcpStream,
@@ -305,8 +442,7 @@ async fn serve_peer(
     session: Uuid,
     audio_port: u16,
     buffer_ms: u32,
-    peers: Peers,
-    status: Arc<Mutex<Status>>,
+    coordinator: Coordinator,
 ) -> Result<()> {
     let address = stream.peer_addr()?;
     stream.set_nodelay(true)?;
@@ -314,20 +450,22 @@ async fn serve_peer(
     let mut reader = BufReader::new(read);
     let hello: Control =
         tokio::time::timeout(Duration::from_secs(5), protocol::receive(&mut reader)).await??;
-    let (name, udp_port) = match hello {
+    let (name, udp_port, speaker_delay_ms) = match hello {
         Control::Hello {
             version,
             code: supplied,
             name,
             udp_port,
+            speaker_delay_ms,
         } if version == protocol::VERSION
             && code
                 .as_ref()
                 .is_none_or(|expected| supplied.as_ref() == Some(expected))
             && udp_port != 0
-            && name.len() <= 128 =>
+            && name.len() <= 128
+            && speaker_delay_ms <= 500 =>
         {
-            (name, udp_port)
+            (name, udp_port, speaker_delay_ms)
         }
         _ => {
             protocol::send(
@@ -342,6 +480,11 @@ async fn serve_peer(
     };
     let id = Uuid::new_v4();
     let token = Uuid::new_v4();
+    let target_delay_ms = coordinator
+        .plan()
+        .await
+        .target_delay_ms
+        .max(speaker_delay_ms);
     protocol::send(
         &mut write,
         &Control::Welcome {
@@ -350,24 +493,21 @@ async fn serve_peer(
             token,
             udp_port: audio_port,
             buffer_ms,
+            target_delay_ms,
         },
     )
     .await?;
-    peers.write().await.insert(
+    coordinator.peers.write().await.insert(
         id,
         Peer {
             address: SocketAddr::new(address.ip(), udp_port),
             token,
             name: name.clone(),
+            speaker_delay_ms,
         },
     );
     eprintln!("✓ {name} connected");
-    status.lock().await.clients = peers
-        .read()
-        .await
-        .values()
-        .map(|p| p.name.clone())
-        .collect();
+    coordinator.refresh_clients().await;
     let result = async {
         loop {
             let request: Control =
@@ -375,13 +515,31 @@ async fn serve_peer(
                     .await??;
             let t2 = clock::now_ns();
             match request {
-                Control::Sync { t1 } => {
+                Control::Sync {
+                    t1,
+                    speaker_delay_ms,
+                } => {
+                    ensure!(
+                        speaker_delay_ms <= 500,
+                        "Speaker delay report exceeds 500 ms"
+                    );
+                    {
+                        let mut peers = coordinator.peers.write().await;
+                        let peer = peers.get_mut(&id).context("Participant left the session")?;
+                        if peer.speaker_delay_ms != speaker_delay_ms {
+                            eprintln!("{name} speaker delay: {speaker_delay_ms} ms");
+                            peer.speaker_delay_ms = speaker_delay_ms;
+                        }
+                    }
+                    let target_delay_ms = coordinator.plan().await.target_delay_ms;
                     protocol::send(
                         &mut write,
                         &Control::Synced {
                             t1,
                             t2,
                             t3: clock::now_ns(),
+                            speaker_delay_ms,
+                            target_delay_ms,
                         },
                     )
                     .await?
@@ -393,13 +551,8 @@ async fn serve_peer(
         Ok::<(), anyhow::Error>(())
     }
     .await;
-    peers.write().await.remove(&id);
-    status.lock().await.clients = peers
-        .read()
-        .await
-        .values()
-        .map(|p| p.name.clone())
-        .collect();
+    coordinator.peers.write().await.remove(&id);
+    coordinator.refresh_clients().await;
     eprintln!("{name} disconnected");
     result
 }
@@ -430,10 +583,6 @@ pub async fn host(options: HostOptions) -> Result<()> {
         )
     };
     let settings = Settings::load()?;
-    ensure!(
-        i64::from(options.buffer_ms) + i64::from(settings.latency()) >= 50,
-        "Saved latency offset requires a larger --buffer-ms"
-    );
     let runtime = Runtime::claim(Status::new(
         "host",
         code.clone(),
@@ -468,6 +617,7 @@ pub async fn host(options: HostOptions) -> Result<()> {
     };
     let mut engine =
         AudioEngine::start(!options.tone, settings.device.as_deref(), options.headless).await?;
+    runtime.initialize_output(&engine).await?;
     {
         let mut status = runtime.status.lock().await;
         status.output = engine.device.clone();
@@ -489,6 +639,11 @@ pub async fn host(options: HostOptions) -> Result<()> {
     eprintln!("\nWaiting for devices… (Ctrl-C to stop)");
     let signals = runtime.install_signals();
     let peers: Peers = Arc::new(RwLock::new(HashMap::new()));
+    let coordinator = Coordinator {
+        peers: peers.clone(),
+        config: runtime.config.clone(),
+        status: runtime.status.clone(),
+    };
     let semaphore = Arc::new(Semaphore::new(16));
     let mut clients = JoinSet::new();
     let mut stop = runtime.stop.subscribe();
@@ -509,8 +664,8 @@ pub async fn host(options: HostOptions) -> Result<()> {
                 accepted = tcp.accept() => {
                     let (stream, _) = accepted?;
                     if let Ok(permit) = semaphore.clone().try_acquire_owned() {
-                        let code = code.clone(); let peers = peers.clone(); let status = runtime.status.clone();
-                        clients.spawn(async move { let _permit = permit; let _ = serve_peer(stream, code, session, audio_port, options.buffer_ms, peers, status).await; });
+                        let code = code.clone(); let coordinator = coordinator.clone();
+                        clients.spawn(async move { let _permit = permit; let _ = serve_peer(stream, code, session, audio_port, options.buffer_ms, coordinator).await; });
                     }
                     continue;
                 },
@@ -528,16 +683,25 @@ pub async fn host(options: HostOptions) -> Result<()> {
                 },
                 captured = engine.captures.recv(), if !options.tone => captured.context("System audio capture stopped")?,
             };
-            let timestamp = capture.timestamp.saturating_add(u64::from(options.buffer_ms) * 1_000_000);
-            let latency = runtime.config.read().await.latency();
-            let _ = engine.sender.try_send(CommandFrame::Audio { timestamp: clock::shifted(timestamp, i64::from(latency) * 1_000_000), pcm: capture.pcm.clone() });
-            let targets = peers.read().await.values().map(|p| (p.address, p.token)).collect::<Vec<_>>();
+            let plan = coordinator.plan().await;
+            // All outputs target the same acoustic time. Feed each device earlier
+            // by its own physical delay; every participant retains the full buffer.
+            let audible_time = capture.timestamp.saturating_add(u64::from(options.buffer_ms + plan.target_delay_ms) * 1_000_000);
+            let local_time = audible_time.saturating_sub(u64::from(plan.local_delay_ms) * 1_000_000);
+            let _ = engine.sender.try_send(CommandFrame::Audio { timestamp: local_time, pcm: capture.pcm.clone() });
             let mut sent = 0;
-            for (address, token) in targets {
-                let packet = AudioPacket { session, token, sequence, timestamp, pcm: capture.pcm.clone() }.encode()?;
-                if udp.send_to(&packet, address).await.is_ok() { sent += 1; }
+            for output in plan.outputs {
+                let timestamp = audible_time.saturating_sub(u64::from(output.speaker_delay_ms) * 1_000_000);
+                let packet = AudioPacket { session, token: output.token, sequence, timestamp, pcm: capture.pcm.clone() }.encode()?;
+                if udp.send_to(&packet, output.address).await.is_ok() { sent += 1; }
             }
             let mut status = runtime.status.lock().await;
+            if status.target_delay_ms != plan.target_delay_ms {
+                eprintln!("Session speaker delay target: {} ms; coordinating all outputs", plan.target_delay_ms);
+            }
+            status.target_delay_ms = plan.target_delay_ms;
+            status.applied_delay_ms = plan.local_delay_ms;
+            status.compensation_ms = plan.target_delay_ms - plan.local_delay_ms;
             status.sent += sent; status.scheduled += 1;
             sequence = sequence.wrapping_add(1);
         }
@@ -567,16 +731,36 @@ impl<T> Drop for AbortOnDrop<T> {
 async fn exchange(
     reader: &mut BufReader<tokio::net::tcp::OwnedReadHalf>,
     writer: &mut tokio::net::tcp::OwnedWriteHalf,
-) -> Result<Sample> {
+    speaker_delay_ms: u32,
+) -> Result<(Sample, u32)> {
     let t1 = clock::now_ns();
-    protocol::send(writer, &Control::Sync { t1 }).await?;
+    protocol::send(
+        writer,
+        &Control::Sync {
+            t1,
+            speaker_delay_ms,
+        },
+    )
+    .await?;
     let response: Control = tokio::time::timeout(Duration::from_secs(3), protocol::receive(reader))
         .await
         .context("Clock synchronization timed out")??;
     let t4 = clock::now_ns();
     match response {
-        Control::Synced { t1: echoed, t2, t3 } if echoed == t1 => {
-            Sample::from_exchange(t1, t2, t3, t4).context("Invalid clock sample")
+        Control::Synced {
+            t1: echoed,
+            t2,
+            t3,
+            speaker_delay_ms: accepted,
+            target_delay_ms,
+        } if echoed == t1
+            && accepted == speaker_delay_ms
+            && (accepted..=500).contains(&target_delay_ms) =>
+        {
+            Ok((
+                Sample::from_exchange(t1, t2, t3, t4).context("Invalid clock sample")?,
+                target_delay_ms,
+            ))
         }
         _ => bail!("Invalid clock synchronization response"),
     }
@@ -611,6 +795,8 @@ async fn client_connection(
     let udp = UdpSocket::bind(SocketAddr::new(bind, 0)).await?;
     let (read, mut write) = stream.into_split();
     let mut reader = BufReader::new(read);
+    let mut delay_changes = runtime.delay_changes.subscribe();
+    let initial_delay_ms = runtime.config.read().await.latency() as u32;
     protocol::send(
         &mut write,
         &Control::Hello {
@@ -618,28 +804,39 @@ async fn client_connection(
             code: options.code.clone(),
             name: hostname(),
             udp_port: udp.local_addr()?.port(),
+            speaker_delay_ms: initial_delay_ms,
         },
     )
     .await?;
     let welcome: Control =
         tokio::time::timeout(Duration::from_secs(3), protocol::receive(&mut reader)).await??;
-    let (session, token, audio_port, buffer_ms) = match welcome {
+    let (session, token, audio_port, buffer_ms, mut target_delay_ms) = match welcome {
         Control::Welcome {
             version,
             session,
             token,
             udp_port,
             buffer_ms,
-        } if version == protocol::VERSION && (50..=500).contains(&buffer_ms) && udp_port != 0 => {
-            (session, token, udp_port, buffer_ms)
+            target_delay_ms,
+        } if version == protocol::VERSION
+            && (50..=500).contains(&buffer_ms)
+            && udp_port != 0
+            && (initial_delay_ms..=500).contains(&target_delay_ms) =>
+        {
+            (session, token, udp_port, buffer_ms, target_delay_ms)
         }
         Control::Reject { reason } => bail!("Host rejected the connection: {reason}"),
         _ => bail!("Invalid session handshake"),
     };
-    ensure!(
-        i64::from(buffer_ms) + i64::from(runtime.config.read().await.latency()) >= 50,
-        "Saved latency offset leaves less than 50ms of buffering"
-    );
+    {
+        let config = runtime.config.read().await;
+        let mut status = runtime.status.lock().await;
+        status.buffer_ms = buffer_ms;
+        status.latency_ms = config.latency();
+        status.target_delay_ms = target_delay_ms;
+        status.applied_delay_ms = initial_delay_ms;
+        status.compensation_ms = target_delay_ms - initial_delay_ms;
+    }
     udp.connect(SocketAddr::new(host.ip(), audio_port)).await?;
     runtime.status.lock().await.state = "synchronizing".into();
     let mut sync = ClockSync::default();
@@ -647,8 +844,12 @@ async fn client_connection(
         offset_ns: 0,
         rtt_ns: u64::MAX,
     };
+    let mut applied_delay_ms = initial_delay_ms;
     for _ in 0..12 {
-        best = sync.observe(exchange(&mut reader, &mut write).await?);
+        applied_delay_ms = runtime.config.read().await.latency() as u32;
+        let (sample, target) = exchange(&mut reader, &mut write, applied_delay_ms).await?;
+        best = sync.observe(sample);
+        target_delay_ms = target;
         tokio::time::sleep(Duration::from_millis(3)).await;
     }
     let offset = Arc::new(AtomicI64::new(best.offset_ns));
@@ -657,6 +858,9 @@ async fn client_connection(
         let mut status = runtime.status.lock().await;
         status.state = "playing".into();
         status.buffer_ms = buffer_ms;
+        status.target_delay_ms = target_delay_ms;
+        status.applied_delay_ms = applied_delay_ms;
+        status.compensation_ms = target_delay_ms - applied_delay_ms;
         status.control_port = host.port();
         status.addresses = vec![host];
         status.clock_offset_ms = best.offset_ns as f64 / 1_000_000.;
@@ -668,10 +872,17 @@ async fn client_connection(
     );
     let clock_offset = offset.clone();
     let clock_rtt = rtt.clone();
+    let config = runtime.config.clone();
+    let status = runtime.status.clone();
     let mut clock_task = AbortOnDrop(tokio::spawn(async move {
         loop {
-            tokio::time::sleep(Duration::from_secs(2)).await;
-            let best = sync.observe(exchange(&mut reader, &mut write).await?);
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_secs(2)) => {},
+                changed = delay_changes.changed() => { changed.context("Session delay controls stopped")?; },
+            }
+            let reported = config.read().await.latency() as u32;
+            let (sample, target) = exchange(&mut reader, &mut write, reported).await?;
+            let best = sync.observe(sample);
             let previous = clock_offset.load(Ordering::Relaxed);
             // At most 0.2ms per update avoids abrupt jumps in queued audio.
             clock_offset.store(
@@ -683,6 +894,13 @@ async fn client_connection(
                 Ordering::Relaxed,
             );
             clock_rtt.store(best.rtt_ns, Ordering::Relaxed);
+            let mut status = status.lock().await;
+            if status.target_delay_ms != target || status.applied_delay_ms != reported {
+                eprintln!("Speaker delay reported: {reported} ms; automatic added delay: {} ms; session target: {target} ms", target - reported);
+            }
+            status.target_delay_ms = target;
+            status.applied_delay_ms = reported;
+            status.compensation_ms = target - reported;
         }
         #[allow(unreachable_code)]
         Ok::<(), anyhow::Error>(())
@@ -701,8 +919,8 @@ async fn client_connection(
                 received = udp.recv(&mut bytes) => {
                     let count = received?;
                     if let Ok(mut packet) = AudioPacket::decode(&bytes[..count], session, token) {
-                        let latency = runtime.config.read().await.latency();
-                        packet.timestamp = clock::shifted(packet.timestamp, offset.load(Ordering::Relaxed).saturating_add(i64::from(latency) * 1_000_000));
+                        // The host has already applied this output's compensation.
+                        packet.timestamp = clock::shifted(packet.timestamp, offset.load(Ordering::Relaxed));
                         jitter.push(packet, clock::now_ns());
                         last_audio = tokio::time::Instant::now();
                         runtime.status.lock().await.received += 1;
@@ -744,7 +962,7 @@ pub async fn join(mut options: JoinOptions) -> Result<()> {
     .await?;
     let mut engine =
         AudioEngine::start(false, settings.device.as_deref(), options.headless).await?;
-    runtime.status.lock().await.output = engine.device.clone();
+    runtime.initialize_output(&engine).await?;
     let _output_changes = runtime.follow_output_changes(&mut engine);
     eprintln!(
         "\n  OTO 🎵\n\nJoining {}\nOutput: {}\nSearching for host… (Ctrl-C to leave)",

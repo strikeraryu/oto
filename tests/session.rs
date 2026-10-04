@@ -126,7 +126,7 @@ fn multi_client_session_controls_and_reconnection() {
     // Connection codes authorize the handshake; a different code is rejected.
     let mut tcp = TcpStream::connect(&address).unwrap();
     tcp.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
-    writeln!(tcp, "{}", serde_json::json!({"type":"hello", "version":1, "code":"ZZZZZ", "name":"intruder", "udp_port":9999})).unwrap();
+    writeln!(tcp, "{}", serde_json::json!({"type":"hello", "version":oto::protocol::VERSION, "code":"ZZZZZ", "name":"intruder", "udp_port":9999, "speaker_delay_ms":0})).unwrap();
     let mut line = String::new();
     BufReader::new(tcp).read_line(&mut line).unwrap();
     assert_eq!(
@@ -138,7 +138,7 @@ fn multi_client_session_controls_and_reconnection() {
     writeln!(
         tcp,
         "{}",
-        serde_json::json!({"type":"hello", "version":1, "name":"no-code", "udp_port":9999})
+        serde_json::json!({"type":"hello", "version":oto::protocol::VERSION, "name":"no-code", "udp_port":9999, "speaker_delay_ms":0})
     )
     .unwrap();
     let mut line = String::new();

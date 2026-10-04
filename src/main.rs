@@ -7,6 +7,8 @@ use oto::{
 };
 use std::net::{IpAddr, SocketAddr};
 
+mod tui;
+
 #[derive(Parser)]
 #[command(
     name = "oto",
@@ -15,7 +17,7 @@ use std::net::{IpAddr, SocketAddr};
 )]
 struct Cli {
     #[command(subcommand)]
-    command: Commands,
+    command: Option<Commands>,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -26,6 +28,8 @@ enum Source {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Open the interactive terminal interface.
+    Tui,
     /// Capture system audio and host a session (macOS 14.2+).
     Host {
         #[arg(long, value_enum, default_value = "system")]
@@ -71,10 +75,11 @@ enum Commands {
     },
     /// Select an output by UID or exact name; use "default" for system output.
     Device { device: String },
-    /// Show or set a per-output delay, such as +40ms or -20ms.
+    /// Report this speaker's delay (0–500ms); the host coordinates all outputs.
+    #[command(alias = "speaker-delay")]
     Latency {
         #[arg(allow_hyphen_values = true)]
-        offset: Option<String>,
+        delay: Option<String>,
     },
     /// Check macOS support, audio devices and configuration.
     Doctor,
@@ -94,8 +99,8 @@ fn parse_host(value: &str) -> Result<SocketAddr, String> {
 fn latency_ms(value: &str) -> Result<i32> {
     let value = value.strip_suffix("ms").unwrap_or(value).parse::<i32>()?;
     ensure!(
-        (-500..=500).contains(&value),
-        "Latency must be between -500ms and +500ms"
+        (0..=500).contains(&value),
+        "Speaker delay must be between 0 and 500 ms"
     );
     Ok(value)
 }
@@ -109,9 +114,24 @@ fn session_missing(error: &anyhow::Error) -> bool {
     })
 }
 
+async fn output_settings() -> Result<Settings> {
+    let mut settings = Settings::load()?;
+    let devices = audio::devices().await?;
+    let output = devices
+        .iter()
+        .find(|device| match &settings.device {
+            Some(uid) => &device.uid == uid,
+            None => device.is_default,
+        })
+        .ok_or_else(|| anyhow::anyhow!("Selected audio output is unavailable"))?;
+    settings.activate_output(Some(output.uid.clone()));
+    Ok(settings)
+}
+
 async fn run() -> Result<()> {
     let cli = Cli::parse();
-    match cli.command {
+    match cli.command.unwrap_or(Commands::Tui) {
+        Commands::Tui => tui::run().await?,
         Commands::Host {
             source,
             buffer_ms,
@@ -158,7 +178,7 @@ async fn run() -> Result<()> {
                 if json {
                     println!("{}", serde_json::to_string_pretty(&status)?);
                 } else {
-                    println!("{}: {}\nCode: {}\nControl port: {}\nOutput: {}\nBuffer: {}ms | Offset: {:+}ms\nClock offset: {:.3}ms | RTT: {:.3}ms\nClients: {}\nPackets sent: {} | Received: {} | Scheduled: {}\nMissing: {} | Late: {}", status.role, status.state, status.code.as_deref().unwrap_or("not required"), status.control_port, status.output, status.buffer_ms, status.latency_ms, status.clock_offset_ms, status.rtt_ms, status.clients.join(", "), status.sent, status.received, status.scheduled, status.missing, status.late);
+                    println!("{}: {}\nCode: {}\nControl port: {}\nOutput: {}\nBuffer: {}ms | Speaker delay: {}ms\nAutomatic added delay: {}ms | Slowest speaker: {}ms\nClock offset: {:.3}ms | RTT: {:.3}ms\nClients: {}\nPackets sent: {} | Received: {} | Scheduled: {}\nMissing: {} | Late: {}", status.role, status.state, status.code.as_deref().unwrap_or("not required"), status.control_port, status.output, status.buffer_ms, status.latency_ms, status.compensation_ms, status.target_delay_ms, status.clock_offset_ms, status.rtt_ms, status.clients.join(", "), status.sent, status.received, status.scheduled, status.missing, status.late);
                     for address in status.addresses {
                         println!("Host address: {address}");
                     }
@@ -219,21 +239,32 @@ async fn run() -> Result<()> {
             }
             println!("Output: {name}");
         }
-        Commands::Latency { offset } => {
-            if let Some(offset) = offset {
-                let ms = latency_ms(&offset)?;
+        Commands::Latency { delay } => {
+            if let Some(delay) = delay {
+                let ms = latency_ms(&delay)?;
                 match session::local_command(&LocalCommand::Latency { ms }).await {
                     Ok(response) => ensure!(response.ok, "{}", response.message),
                     Err(error) if session_missing(&error) => {
-                        let mut settings = Settings::load()?;
+                        let mut settings = output_settings().await?;
                         settings.set_latency(ms);
                         settings.save()?;
                     }
                     Err(error) => return Err(error),
                 }
-                println!("Output delay: {ms:+}ms");
+                println!("Speaker delay estimate: {ms}ms (Oto coordinates other outputs)");
             } else {
-                println!("Output delay: {:+}ms", Settings::load()?.latency());
+                let ms = match session::local_command(&LocalCommand::Status).await {
+                    Ok(response) => {
+                        ensure!(response.ok, "{}", response.message);
+                        response
+                            .status
+                            .ok_or_else(|| anyhow::anyhow!("Session status is missing"))?
+                            .latency_ms
+                    }
+                    Err(error) if session_missing(&error) => output_settings().await?.latency(),
+                    Err(error) => return Err(error),
+                };
+                println!("Speaker delay estimate: {ms}ms");
             }
         }
         Commands::Doctor => {
@@ -286,7 +317,7 @@ mod tests {
     #[test]
     fn default_port_and_explicit_override() {
         let Cli {
-            command: Commands::Host { port, no_code, .. },
+            command: Some(Commands::Host { port, no_code, .. }),
         } = Cli::try_parse_from(["oto", "host"]).unwrap()
         else {
             panic!("expected host")
@@ -294,7 +325,7 @@ mod tests {
         assert_eq!(port, 47670);
         assert!(!no_code);
         let Cli {
-            command: Commands::Host { port, no_code, .. },
+            command: Some(Commands::Host { port, no_code, .. }),
         } = Cli::try_parse_from(["oto", "host", "--port", "9000", "--no-code"]).unwrap()
         else {
             panic!("expected host")
@@ -307,7 +338,7 @@ mod tests {
     #[test]
     fn direct_join_can_omit_code_and_port() {
         let Cli {
-            command: Commands::Join { code, host, .. },
+            command: Some(Commands::Join { code, host, .. }),
         } = Cli::try_parse_from(["oto", "join", "--host", "192.168.1.14"]).unwrap()
         else {
             panic!("expected join")

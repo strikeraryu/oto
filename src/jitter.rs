@@ -20,7 +20,9 @@ impl JitterBuffer {
             self.late += 1;
             return;
         }
-        if packet.timestamp > now.saturating_add(1_000_000_000) {
+        // A 500ms network buffer plus 500ms speaker compensation can reach 1s;
+        // leave margin for capture callback timestamps and clock estimation.
+        if packet.timestamp > now.saturating_add(1_500_000_000) {
             return;
         }
         if self.packets.len() >= 100 && !self.packets.contains_key(&packet.sequence) {

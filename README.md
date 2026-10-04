@@ -11,10 +11,37 @@ Install Rust and Xcode Command Line Tools, then:
 ```sh
 cargo build --release
 ./target/release/oto doctor
-./target/release/oto host
+./target/release/oto
 ```
 
-The host prints its local IP address, TCP port, a five-character code, and a copyable join command. On another Mac:
+## Interactive terminal interface
+
+Run `oto` (or `oto tui`) to open the TUI. The header shows this Mac's local IP; F4 lists all network addresses, and `?` opens keyboard help. Requires an interactive terminal at least 64 columns by 26 rows.
+
+- **Host:** choose with-code or no-code connections, set a port (default `47670`) and buffer (default `200` ms), then select **Start hosting**. The session view shows its code, actual port, addresses, and connected clients.
+- **Join:** choose with-code or no-code connections. With a code, leave the IP blank for automatic discovery or enter an IP and port for a direct connection. No-code connections require a host IP. The session view shows the code when used and the host address once connected.
+- **Navigate:** Tab / Shift-Tab or Up / Down moves between fields; Left / Right selects the Host / Join tab. Enter selects an action; Space toggles the connection mode. F1 opens Host, F2 opens Join, and Ctrl-U clears a field. Paste IPs and codes directly into their fields.
+- **During playback:** `+` (or `=`) / `-` increases or decreases **this speaker's reported delay** by **10 ms**; `]` / `[` changes it by **1 ms**. `0` resets its report. If your Bluetooth speaker sounds late, increase the value on the Mac connected to that speaker. The host automatically adds the required delay to faster outputs throughout the session. Reports range from 0–500 ms and remain separate from clock synchronization.
+- **Output and session controls:** `d` opens the local output picker, `s` stops hosting or leaves the joined session, and `q` opens quit controls. Tab and Enter also operate the visible action buttons.
+- **Logs:** Page Up / Page Down scrolls the most recent 500 log lines. End resumes following new messages during a session. Logs include startup errors, connections, reconnect attempts, output changes, and latency adjustments.
+
+The TUI manages sessions it starts and stops them on exit. If a CLI session is already running, it shows that session's status and provides local controls; quit controls offer `d` to close the TUI while leaving that existing session running. Existing session logs from before attachment are not available, but subsequent observed status changes appear in the log panel.
+
+For Bluetooth alignment, report the delay on the Mac connected to the late speaker. For example:
+
+| Output | Reported speaker delay | Automatic added delay |
+|---|---:|---:|
+| A: Bluetooth | 150 ms | 0 ms |
+| B: Built-in | 0 ms | 150 ms |
+| C: USB | 30 ms | 120 ms |
+
+Each device reports once; the host recalculates compensation when reports change or participants join/leave. The session view shows **This speaker's delay**, **Auto added**, and the slowest speaker's **Target**. Reports are saved by actual output UID, including while following the macOS default, and restored and sent to the host when switching outputs. Other clients' compensation statistics refresh with their next clock exchange (within roughly two seconds); their audio timestamps are updated by the host on subsequent packets.
+
+The previous TUI's values meant extra local playback delay. Those values are preserved in the legacy `offsets` settings map and are no longer applied. New speaker-delay estimates start at zero; enter the estimate on each late speaker. Update the binary on **every Mac** and restart sessions: this coordination uses protocol version 2 and cannot mix with version 1 hosts or clients. Changing reports during playback can briefly skip or pause sound while queued audio settles onto the new timing.
+
+## Command-line use
+
+You can also run `oto host` directly. The host prints its local IP address, TCP port, a five-character code, and a copyable join command. On another Mac:
 
 ```sh
 oto join 7K4P9
@@ -27,6 +54,8 @@ Keep `host` and `join` running in their terminals. Ctrl-C or `oto leave` stops t
 ## Commands
 
 ```sh
+oto                             # Interactive terminal interface
+oto tui                         # Explicitly open the TUI
 oto host                         # System audio; default 200ms buffer
 oto host --no-code               # Direct connections without a connection code
 oto host --port 9000             # Override the default TCP port, 47670
@@ -41,14 +70,15 @@ oto leave
 oto devices                     # Output names and persistent UIDs
 oto device "JBL Flip 6"          # Exact name or UID; applies to a running session
 oto device default              # Follow macOS output changes automatically
-oto latency +40ms               # Delay this output by another 40ms
-oto latency                     # Show its saved delay
+oto latency 150ms               # Report this speaker's estimated delay
+oto speaker-delay 150ms         # Alias for oto latency
+oto latency                     # Show this speaker's saved estimate
 oto doctor
 ```
 
 By default, Oto follows the macOS output selection throughout a session. Connect a Bluetooth speaker and select it in macOS Sound settings or Control Center; both hosts and clients switch their local playback automatically. `oto status` shows the new output. Selecting an explicit name or UID with `oto device` pins that output; run `oto device default` to resume following macOS.
 
-Offsets are saved per explicitly selected output UID. The `default` selection has its own saved offset. Positive offsets add delay: if speaker A is 40ms faster than speaker B, apply `+40ms` on Mac A. Negative offsets consume buffering time; Oto requires at least 50ms to remain. The default buffer is 200ms, configurable from 50–500ms.
+Speaker-delay estimates are saved per actual output UID. `oto latency 150ms` sets an absolute estimate; the TUI shortcuts increment or decrement it. Estimates are nonnegative, from 0–500 ms. The default network buffer is 200 ms, configurable from 50–500 ms, and remains available to every participant independently of speaker compensation.
 
 If Bonjour is blocked by a router, VPN, or firewall:
 
@@ -72,11 +102,11 @@ oto join --host 192.168.1.14
 
 Audio is stereo PCM, 48kHz, signed 16-bit little-endian. Five-millisecond packets are 1,024 bytes, below a standard LAN MTU. Bandwidth is approximately 1.64Mbps per client including Oto's packet header, plus network overhead. The host supports up to 16 simultaneous clients.
 
-The control channel uses bounded JSON messages over TCP. A 12-sample NTP-style exchange estimates client-minus-host monotonic clock offset; low-RTT measurements are refreshed every two seconds, with gradual corrections. UDP packets contain a protocol version, session ID, per-connection random token, sequence number, presentation timestamp, and PCM. Clients reorder packets briefly, then place audio into the native timestamp ring. Hardware callback timestamps determine which samples to render; rate conversion follows that timeline rather than an accumulating software sleep loop. Missing samples render as silence. Connections resynchronize and refill the buffer after interruption.
+The control channel uses bounded JSON messages over TCP. Clients report their speaker delay during the handshake and clock exchanges; changing the value triggers an immediate exchange. A 12-sample NTP-style exchange estimates client-minus-host monotonic clock offset; low-RTT measurements are refreshed every two seconds, with gradual corrections. The host finds the slowest reported output, including its own, and schedules each device at `capture time + network buffer + slowest delay − device delay`. UDP packets contain a protocol version, session ID, per-connection random token, sequence number, a hardware playback timestamp compensated for that receiver, and PCM. Clients add only their clock offset, reorder packets briefly, then place audio into the native timestamp ring. Hardware callback timestamps determine which samples to render; rate conversion follows that timeline rather than an accumulating software sleep loop. Missing samples render as silence. Connections resynchronize, re-report speaker delay, and refill the buffer after interruption.
 
 Bonjour advertises `_oto._tcp.local.` because discovery leads to the reliable control endpoint. The short code is public discovery metadata and prevents accidental joins. Per-client tokens identify audio packets from that connection. **The MVP uses plaintext TCP/UDP on a trusted LAN; the code and token do not provide encryption or protection against a malicious LAN participant.**
 
-Bluetooth speakers add device-dependent acoustic delay. Core Audio timing alone does not measure that delay; use manual offsets. This implementation has no automatic acoustic calibration and makes no measured inter-speaker synchronization claim yet.
+Bluetooth speakers add device-dependent acoustic delay. Oto coordinates compensation automatically from your reported estimates; it does not automatically measure or acoustically calibrate those estimates. Accurate audible alignment requires tuning those values on the actual speakers.
 
 ## Installation and releases
 
@@ -103,6 +133,6 @@ cargo test --test native -- --ignored
 
 Tests cover clock offset math, malformed and unauthorized packets, control message limits, reordering/loss, live status/latency controls, multiple loopback clients, host restart and reconnection, and Bonjour discovery. Transport integration tests use a diagnostic source and a headless renderer; they do not grant capture permission or play sound. `OTO_CONFIG_DIR` isolates session state for development and tests; normal state lives in `~/Library/Application Support/Oto`.
 
-For a physical check, run the diagnostic tone on two Macs, calibrate the speaker offsets, and record both outputs with a shared microphone or recorder. Compare transient arrival times over an extended run and after a Wi-Fi interruption. Then repeat with system capture. Audible alignment and long-run Bluetooth drift require this hardware check.
+For a physical check, run the diagnostic tone on two Macs, tune the reported speaker delays, and record both outputs with a shared microphone or recorder. Compare transient arrival times over an extended run and after a Wi-Fi interruption. Then repeat with system capture. Audible alignment and long-run Bluetooth drift require this hardware check.
 
 The product specification is in [DESIGN.MD](DESIGN.MD). Automatic acoustic calibration, Opus, adaptive network buffering, Internet sessions, mobile clients, and Linux/Windows audio backends are future work.

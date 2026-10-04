@@ -55,7 +55,15 @@ pub fn helper_path() -> Result<PathBuf> {
 }
 
 pub async fn devices() -> Result<Vec<Device>> {
-    let output = Command::new(helper_path()?).arg("devices").output().await?;
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        Command::new(helper_path()?)
+            .arg("devices")
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    .context("Audio device enumeration timed out")??;
     ensure!(
         output.status.success(),
         "Audio device enumeration failed: {}",
@@ -81,6 +89,7 @@ pub struct AudioEngine {
     pub device_changes: Option<mpsc::Receiver<Device>>,
     tasks: Vec<tokio::task::JoinHandle<()>>,
     pub device: String,
+    pub device_uid: Option<String>,
 }
 
 async fn read_record(reader: &mut ChildStdout) -> Result<(u32, u64, Vec<u8>)> {
@@ -130,6 +139,7 @@ impl AudioEngine {
                 device_changes: Some(device_changes),
                 tasks: vec![task],
                 device: "headless".into(),
+                device_uid: None,
             });
         }
         let mut child = Command::new(helper_path()?)
@@ -184,6 +194,7 @@ impl AudioEngine {
             device_changes: Some(device_changes),
             tasks: vec![writer, reader],
             device: device.name,
+            device_uid: Some(device.uid),
         })
     }
     pub async fn stop(&mut self) {

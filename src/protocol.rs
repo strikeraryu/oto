@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
 use uuid::Uuid;
 
-pub const VERSION: u8 = 1;
+pub const VERSION: u8 = 2;
 pub const DEFAULT_PORT: u16 = 47670;
 pub const RATE: u32 = 48_000;
 pub const CHANNELS: u8 = 2;
@@ -21,6 +21,8 @@ pub enum Control {
         code: Option<String>,
         name: String,
         udp_port: u16,
+        #[serde(default)]
+        speaker_delay_ms: u32,
     },
     Welcome {
         version: u8,
@@ -28,14 +30,18 @@ pub enum Control {
         token: Uuid,
         udp_port: u16,
         buffer_ms: u32,
+        target_delay_ms: u32,
     },
     Sync {
         t1: u64,
+        speaker_delay_ms: u32,
     },
     Synced {
         t1: u64,
         t2: u64,
         t3: u64,
+        speaker_delay_ms: u32,
+        target_delay_ms: u32,
     },
     Reject {
         reason: String,
@@ -79,7 +85,8 @@ pub struct AudioPacket {
     pub session: Uuid,
     pub token: Uuid,
     pub sequence: u64,
-    /// Intended presentation time in host monotonic nanoseconds.
+    /// Hardware playback time in host monotonic nanoseconds, already compensated
+    /// for this receiver's reported speaker delay.
     pub timestamp: u64,
     pub pcm: Vec<u8>,
 }
